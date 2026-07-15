@@ -70,7 +70,8 @@ def commit_entry(session, payload: dict, created_by: str):
     """
     kind = payload.get("kind")
     entry_date = _parse_date(payload.get("date"))
-    result = {"summary_lines": [], "low_stock": [], "new_items": []}
+    result = {"summary_lines": [], "low_stock": [], "new_items": [],
+              "payment_ids": [], "txn_ids": []}
 
     if kind == "purchase":
         payment = None
@@ -84,6 +85,7 @@ def commit_entry(session, payload: dict, created_by: str):
                 created_by=created_by)
             session.add(payment)
             session.flush()
+            result["payment_ids"].append(payment.id)
         for line in payload.get("lines", []):
             item, created = get_or_create_item(session, line["item"],
                                                line.get("unit", "kg"))
@@ -98,6 +100,7 @@ def commit_entry(session, payload: dict, created_by: str):
                 payment_id=payment.id if payment else None)
             session.add(txn)
             session.flush()
+            result["txn_ids"].append(txn.id)
             stock = current_stock(session, item.id)
             result["summary_lines"].append(
                 f"{item.name} +{qty:g}{item.unit} → stock {stock:g}{item.unit}")
@@ -114,9 +117,34 @@ def commit_entry(session, payload: dict, created_by: str):
             description=payload.get("description"), vendor=payload.get("vendor"),
             entry_date=entry_date, created_by=created_by)
         session.add(payment)
+        session.flush()
+        result["payment_ids"].append(payment.id)
         result["summary_lines"].append(
             f"Expense logged: {config.CURRENCY}{amount:,.0f} "
             f"({(payload.get('expense_category') or 'other').replace('_', ' ')})")
+
+    elif kind == "expense_batch":
+        expenses = payload.get("expenses") or []
+        if not expenses:
+            raise ValueError("No expense lines found in this message.")
+        total = 0.0
+        for e in expenses:
+            amount = float(e.get("amount") or 0)
+            total += amount
+            p = Payment(
+                amount=amount,
+                category=e.get("category") or payload.get("expense_category") or "other",
+                description=e.get("description"),
+                vendor=payload.get("vendor"),
+                entry_date=_parse_date(e.get("date")),
+                created_by=created_by)
+            session.add(p)
+            session.flush()
+            result["payment_ids"].append(p.id)
+        cat = (expenses[0].get("category") or payload.get("expense_category")
+               or "other").replace("_", " ")
+        result["summary_lines"].append(
+            f"{len(expenses)} expenses logged, total {config.CURRENCY}{total:,.0f} ({cat})")
 
     elif kind == "production":
         product = find_product(session, payload.get("product"))
@@ -135,6 +163,7 @@ def commit_entry(session, payload: dict, created_by: str):
                                created_by=created_by)
             session.add(txn)
             session.flush()
+            result["txn_ids"].append(txn.id)
             stock = current_stock(session, bl.item_id)
             result["summary_lines"].append(
                 f"{bl.item.name} -{used:g}{bl.item.unit} → stock {stock:g}{bl.item.unit}")
@@ -147,10 +176,12 @@ def commit_entry(session, payload: dict, created_by: str):
             if not item:
                 raise ValueError(f"Unknown item '{line['item']}'")
             qty = float(line["qty"])
-            session.add(InventoryTxn(item_id=item.id, qty=-qty, txn_type="manual_out",
-                                     note=payload.get("description"),
-                                     entry_date=entry_date, created_by=created_by))
+            txn = InventoryTxn(item_id=item.id, qty=-qty, txn_type="manual_out",
+                               note=payload.get("description"),
+                               entry_date=entry_date, created_by=created_by)
+            session.add(txn)
             session.flush()
+            result["txn_ids"].append(txn.id)
             stock = current_stock(session, item.id)
             result["summary_lines"].append(
                 f"{item.name} -{qty:g}{item.unit} → stock {stock:g}{item.unit}")
@@ -190,6 +221,37 @@ def last_purchase(session, item_id):
             .filter(InventoryTxn.item_id == item_id,
                     InventoryTxn.txn_type == "purchase")
             .order_by(InventoryTxn.created_at.desc()).first())
+
+
+# ------------------------------------------------------------------ void
+def void_entry(session, payment_ids, txn_ids):
+    """Remove a committed entry's rows (undo / accidental upload)."""
+    removed = 0
+    for tid in txn_ids or []:
+        txn = session.get(InventoryTxn, tid)
+        if txn:
+            session.delete(txn)
+            removed += 1
+    for pid in payment_ids or []:
+        p = session.get(Payment, pid)
+        if p:
+            # also remove any inventory txns linked to this payment
+            for txn in session.query(InventoryTxn).filter(
+                    InventoryTxn.payment_id == pid).all():
+                session.delete(txn)
+                removed += 1
+            session.delete(p)
+            removed += 1
+    session.commit()
+    return removed
+
+
+def wipe_all_data(session):
+    """Danger zone: delete every ledger row (used to clear test data)."""
+    for model in (StockCount, InventoryTxn, Payment, PendingEntry,
+                  BomLine, Product, Item):
+        session.query(model).delete()
+    session.commit()
 
 
 # ------------------------------------------------------------ stock count

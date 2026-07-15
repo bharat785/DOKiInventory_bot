@@ -116,33 +116,75 @@ def stock_page(request: Request):
 
 # ---------------------------------------------------------------- spend
 @router.get("/spend", response_class=HTMLResponse)
-def spend_page(request: Request):
+def spend_page(request: Request, month: str = None):
     if (r := guard(request)):
         return r
     session = SessionLocal()
     try:
-        month_start = dt.date.today().replace(day=1)
+        # which month? default = current. month param format: YYYY-MM
+        today = dt.date.today()
+        try:
+            y, m = (int(x) for x in (month or "").split("-"))
+            month_start = dt.date(y, m, 1)
+        except (ValueError, TypeError):
+            month_start = today.replace(day=1)
+        next_month = (month_start.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+        label = month_start.strftime("%B %Y")
+
         by_cat = (session.query(Payment.category, func.sum(Payment.amount))
-                  .filter(Payment.entry_date >= month_start)
+                  .filter(Payment.entry_date >= month_start,
+                          Payment.entry_date < next_month)
                   .group_by(Payment.category).all())
         labels = [c.replace("_", " ") for c, _ in by_cat]
         values = [round(v, 2) for _, v in by_cat]
-        recent = (session.query(Payment).order_by(Payment.created_at.desc())
-                  .limit(40).all())
+        month_total = sum(values)
+
+        payments = (session.query(Payment)
+                    .filter(Payment.entry_date >= month_start,
+                            Payment.entry_date < next_month)
+                    .order_by(Payment.entry_date.desc()).limit(200).all())
         rows = "".join(
             f"<tr><td>{p.entry_date}</td><td>{config.CURRENCY}{p.amount:,.0f}</td>"
             f"<td>{p.category.replace('_', ' ')}</td><td>{p.vendor or '—'}</td>"
-            f"<td>{(p.description or '')[:60]}</td><td>{(p.created_by or '').split(' (')[0]}</td></tr>"
-            for p in recent)
+            f"<td>{(p.description or '')[:60]}</td><td>{(p.created_by or '').split(' (')[0]}</td>"
+            f"<td><form method=post action=/payments/delete/{p.id} "
+            f"onsubmit=\"return confirm('Delete this payment (and any stock entries "
+            f"from the same invoice)? This cannot be undone.')\">"
+            f"<button style='background:var(--warn);padding:2px 8px'>✕</button></form></td></tr>"
+            for p in payments)
+
+        # month selector: last 12 months with totals
+        opts, hist_rows = "", ""
+        cursor = today.replace(day=1)
+        for _ in range(12):
+            key = cursor.strftime("%Y-%m")
+            nxt = (cursor.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+            total = (session.query(func.coalesce(func.sum(Payment.amount), 0))
+                     .filter(Payment.entry_date >= cursor,
+                             Payment.entry_date < nxt).scalar())
+            sel = " selected" if cursor == month_start else ""
+            opts += f'<option value="{key}"{sel}>{cursor.strftime("%b %Y")}</option>'
+            if total:
+                hist_rows += (f'<tr><td><a href="/spend?month={key}">'
+                              f'{cursor.strftime("%B %Y")}</a></td>'
+                              f'<td>{config.CURRENCY}{total:,.0f}</td></tr>')
+            cursor = (cursor - dt.timedelta(days=1)).replace(day=1)
+
         body = f"""
-<div class=card><h2>Spend by category (this month)</h2>
+<div class=card><form class=inline method=get action=/spend>
+<label>Month:&nbsp;</label><select name=month onchange="this.form.submit()">{opts}</select>
+</form></div>
+<div class=kpi><div><b>{config.CURRENCY}{month_total:,.0f}</b>total — {label}</div></div>
+<div class=card><h2>Spend by category — {label}</h2>
 <canvas id=c height=110></canvas>
 <script>new Chart(document.getElementById('c'),{{type:'doughnut',
 data:{{labels:{labels},datasets:[{{data:{values}}}]}},
 options:{{plugins:{{legend:{{position:'right'}}}}}}}});</script></div>
-<div class=card><h2>Recent payments</h2><table>
-<tr><th>Date</th><th>Amount</th><th>Category</th><th>Vendor</th><th>Note</th><th>By</th></tr>
-{rows}</table></div>"""
+<div class=card><h2>Payments — {label}</h2><table>
+<tr><th>Date</th><th>Amount</th><th>Category</th><th>Vendor</th><th>Note</th><th>By</th><th></th></tr>
+{rows or '<tr><td colspan=7>No payments this month.</td></tr>'}</table></div>
+<div class=card><h2>Last 12 months</h2><table>
+<tr><th>Month</th><th>Total spend</th></tr>{hist_rows or '<tr><td colspan=2>No history yet.</td></tr>'}</table></div>"""
         return page("Spend", "/spend", body)
     finally:
         session.close()
@@ -260,6 +302,15 @@ def items_page(request: Request):
 <input type=hidden name=product_id value={p.id}>
 <select name=item_id>{opt_items}</select>
 <input name=qty placeholder="qty per unit" size=8><button>Add line</button></form></div>"""
+        danger = f"""<div class=card style="border:1px solid var(--warn)">
+<h2 style="color:var(--warn)">⚠️ Danger zone — wipe all data</h2>
+<p style="color:var(--mut)">Deletes ALL items, stock, payments, recipes, and count history.
+Use this once to clear test data before going live. Cannot be undone.</p>
+<form class=inline method=post action=/admin/wipe
+ onsubmit="return confirm('Really delete ALL data? This cannot be undone.')">
+<input type=password name=password placeholder="Dashboard password">
+<input name=confirm_text placeholder='Type: DELETE EVERYTHING'>
+<button style="background:var(--warn)">Wipe all data</button></form></div>"""
         body = f"""
 <div class=card><h2>Items & alert thresholds</h2>
 <table><tr><th>Item</th><th>Unit</th><th>Alert when below</th></tr>{item_rows}</table>
@@ -275,8 +326,49 @@ def items_page(request: Request):
 <input name=name placeholder="Product name">
 <input name=unit placeholder="unit (pcs/pack/box)" value=pcs size=10>
 <button>Add product</button></form></div>
-{prod_blocks}"""
+{prod_blocks}
+{danger}"""
         return page("Items & Recipes", "/items", body)
+    finally:
+        session.close()
+
+
+@router.post("/payments/delete/{payment_id}")
+def delete_payment(request: Request, payment_id: int):
+    if (r := guard(request)):
+        return r
+    session = SessionLocal()
+    try:
+        logic.void_entry(session, [payment_id], [])
+        return RedirectResponse("/spend", status_code=302)
+    finally:
+        session.close()
+
+
+@router.post("/txns/delete/{txn_id}")
+def delete_txn(request: Request, txn_id: int):
+    if (r := guard(request)):
+        return r
+    session = SessionLocal()
+    try:
+        logic.void_entry(session, [], [txn_id])
+        return RedirectResponse("/", status_code=302)
+    finally:
+        session.close()
+
+
+@router.post("/admin/wipe")
+def admin_wipe(request: Request, password: str = Form(...),
+               confirm_text: str = Form("")):
+    if (r := guard(request)):
+        return r
+    if not hmac.compare_digest(password, config.DASHBOARD_PASSWORD) or \
+            confirm_text.strip().upper() != "DELETE EVERYTHING":
+        return RedirectResponse("/items", status_code=302)
+    session = SessionLocal()
+    try:
+        logic.wipe_all_data(session)
+        return RedirectResponse("/", status_code=302)
     finally:
         session.close()
 

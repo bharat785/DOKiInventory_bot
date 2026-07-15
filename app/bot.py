@@ -30,9 +30,13 @@ def _known_names(session):
 
 def _preview_text(payload: dict, dup) -> str:
     kind = payload.get("kind", "unknown")
-    icon = {"purchase": "📦", "expense": "🧾", "production": "🏭",
-            "stock_out": "📤"}.get(kind, "❓")
+    icon = {"purchase": "📦", "expense": "🧾", "expense_batch": "🧾",
+            "production": "🏭", "stock_out": "📤"}.get(kind, "❓")
     lines = [f"{icon} <b>{kind.replace('_', ' ').title()}</b>"]
+    for e in payload.get("expenses") or []:
+        d = f"{e['date']} — " if e.get("date") else ""
+        lines.append(f"• {d}{e.get('description')} — "
+                     f"{config.CURRENCY}{float(e.get('amount') or 0):,.0f}")
     if payload.get("vendor"):
         lines.append(f"Vendor: {payload['vendor']}")
     if payload.get("date"):
@@ -153,7 +157,8 @@ async def _parse_and_preview(update: Update, text=None, image_bytes=None, mime="
                 "\"produced 300 packs of chikki\"")
             return
         if payload.get("kind") == "unknown" or (
-                payload.get("kind") in ("purchase", "stock_out") and not payload.get("lines")):
+                payload.get("kind") in ("purchase", "stock_out") and not payload.get("lines")) or (
+                payload.get("kind") == "expense_batch" and not payload.get("expenses")):
             await msg.reply_text(
                 "🤔 I couldn't tell what this is. Please rephrase — examples:\n"
                 "• bought 50kg sugar 2100rs from Sri Ram Traders\n"
@@ -182,6 +187,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = SessionLocal()
     try:
         pe = session.get(PendingEntry, int(pid))
+        if action == "undo":
+            if pe and pe.status == "committed":
+                await _handle_undo(q, session, pe)
+            else:
+                await q.edit_message_text("Nothing to undo here.")
+            return
         if not pe or pe.status != "pending":
             await q.edit_message_text("This entry was already handled.")
             return
@@ -196,16 +207,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"❌ Couldn't add: {e}")
             return
         pe.status = "committed"
+        pe.payload = {**pe.payload,
+                      "committed_ids": {"payments": result["payment_ids"],
+                                        "txns": result["txn_ids"]}}
         session.commit()
         lines = ["✔️ <b>Added.</b>"] + result["summary_lines"]
         for name in result["new_items"]:
             lines.append(f"🆕 New item created: {name} — set its alert threshold with "
                          f"\"set {name.lower()} alert to &lt;qty&gt;\"")
-        await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        undo_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("↩️ Undo", callback_data=f"undo:{pe.id}")]])
+        await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                                  reply_markup=undo_kb)
         if result["low_stock"]:
             await send_low_stock_alerts(context.bot, session, result["low_stock"])
     finally:
         session.close()
+
+
+async def _handle_undo(q, session, pe):
+    ids = (pe.payload or {}).get("committed_ids") or {}
+    removed = logic.void_entry(session, ids.get("payments"), ids.get("txns"))
+    pe.status = "undone"
+    session.commit()
+    await q.edit_message_text(
+        f"↩️ Entry removed ({removed} records deleted). "
+        "Stock and spend have been restored.")
 
 
 # ------------------------------------------------------------- stock count

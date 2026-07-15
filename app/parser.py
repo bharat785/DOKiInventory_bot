@@ -20,7 +20,10 @@ message from a factory operator. Extract a structured entry.
 
 Entry kinds:
 - "purchase": raw materials / packaging bought (updates stock AND spend)
-- "expense": money spent with no stock impact (water, repairs, transport, petty cash, etc.)
+- "expense": ONE payment with no stock impact (water, repairs, transport, petty cash, etc.)
+- "expense_batch": MULTIPLE expenses in one message, e.g. a list of dated transport
+  trips or a petty-cash log with several lines. Use whenever there are 2+ separate
+  date+amount records.
 - "production": finished goods produced (e.g. "produced 300 packs of chikki") — stock draw-down
 - "stock_out": raw material issued/removed manually (e.g. "used 20kg flour", "threw away 5kg sugar")
 - "unknown": cannot tell
@@ -40,6 +43,9 @@ Respond with ONLY a JSON object, no markdown fences:
   "product": "product name or null (for production)",
   "product_qty": number or null,
   "expense_category": "raw_material|packaging|utilities|repairs|transport|water|petty_cash|other or null",
+  "expenses": [
+    {{"date": "YYYY-MM-DD or null", "amount": number, "description": "e.g. Okhla to Sonipat", "category": "transport|petty_cash|... or null"}}
+  ],
   "description": "one-line human summary",
   "confidence": 0.0-1.0,
   "issues": ["anything unclear or suspicious"]
@@ -70,7 +76,14 @@ GST invoice rules (very common):
   lower than printed rate").
 - If line totals don't reconcile with the grand total, still report the grand
   total as total_amount and note the mismatch in issues.
-- The invoice date is the document's date, not today."""
+- The invoice date is the document's date, not today.
+
+Expense-batch rules (lists like "26/06/26 Okhla to Sonipat 2800"):
+- Each line = one expense with its own date, description, amount.
+- Indian date formats: DD/MM/YY or DD/MM/YYYY (26/06/26 -> 2026-06-26).
+- Sums like "2800+1500" = one expense of 4300; keep both legs in the description.
+- Trips/routes -> category "transport". Small cash spends -> "petty_cash".
+- "total_amount" = sum of all expenses in the batch."""
 
 
 def _prompt(known_items, known_products):
@@ -163,4 +176,26 @@ def parse_entry(text=None, image_bytes=None, mime="image/jpeg",
     data.setdefault("lines", [])
     data.setdefault("issues", [])
     data.setdefault("confidence", 0.5)
+    _cross_check(data)
     return data
+
+
+def _cross_check(data: dict):
+    """Arithmetic sanity checks — catches misread digits the model missed."""
+    for ln in data.get("lines", []):
+        qty, cost, total = ln.get("qty"), ln.get("unit_cost"), ln.get("line_total")
+        if qty and cost and total:
+            expected = qty * cost
+            if abs(expected - total) > max(1.0, 0.02 * total):
+                implied = round(total / cost, 2)
+                data["issues"].append(
+                    f"CHECK {ln.get('item')}: qty {qty} x rate {cost} = "
+                    f"{expected:,.2f} but line total is {total:,.2f} "
+                    f"(total/rate suggests qty {implied:g})")
+                data["confidence"] = min(data.get("confidence", 0.5), 0.6)
+    lines_sum = sum(ln.get("line_total") or 0 for ln in data.get("lines", []))
+    grand = data.get("total_amount")
+    if grand and lines_sum and lines_sum > grand * 1.1:
+        data["issues"].append(
+            f"line totals sum to {lines_sum:,.2f} vs payable {grand:,.2f} — "
+            "check for discount or misread line")
