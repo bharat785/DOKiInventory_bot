@@ -306,10 +306,10 @@ def items_page(request: Request):
 <h2 style="color:var(--warn)">⚠️ Danger zone — wipe all data</h2>
 <p style="color:var(--mut)">Deletes ALL items, stock, payments, recipes, and count history.
 Use this once to clear test data before going live. Cannot be undone.</p>
-<form class=inline method=post action=/admin/wipe
+<form class="inline" method="post" action="/admin/wipe"
  onsubmit="return confirm('Really delete ALL data? This cannot be undone.')">
-<input type=password name=password placeholder="Dashboard password">
-<input name=confirm_text placeholder='Type: DELETE EVERYTHING'>
+<input type="password" name="password" placeholder="Dashboard password" required>
+<input type="text" name="confirm_text" placeholder="Type: DELETE EVERYTHING" required>
 <button style="background:var(--warn)">Wipe all data</button></form></div>"""
         body = f"""
 <div class=card><h2>Items & alert thresholds</h2>
@@ -358,13 +358,15 @@ def delete_txn(request: Request, txn_id: int):
 
 
 @router.post("/admin/wipe")
-def admin_wipe(request: Request, password: str = Form(...),
-               confirm_text: str = Form("")):
+async def admin_wipe(request: Request):
     if (r := guard(request)):
         return r
+    form = await request.form()
+    password = str(form.get("password") or "")
+    confirm_text = str(form.get("confirm_text") or "")
     if not hmac.compare_digest(password, config.DASHBOARD_PASSWORD) or \
             confirm_text.strip().upper() != "DELETE EVERYTHING":
-        return RedirectResponse("/items", status_code=302)
+        return RedirectResponse("/items?wipe=failed", status_code=302)
     session = SessionLocal()
     try:
         logic.wipe_all_data(session)
