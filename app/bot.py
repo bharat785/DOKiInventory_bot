@@ -98,22 +98,52 @@ async def send_low_stock_alerts(bot, session, breached):
 
 
 # ------------------------------------------------------------- ingestion
+def _pdf_to_jpeg(pdf_bytes: bytes) -> bytes:
+    """Render first 1-2 pages of a PDF to one JPEG for the parser."""
+    import io
+    import pypdfium2 as pdfium
+    from PIL import Image
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    pages = [pdf[i].render(scale=2.0).to_pil() for i in range(min(2, len(pdf)))]
+    if len(pages) == 1:
+        img = pages[0]
+    else:  # stack two pages vertically
+        w = max(p.width for p in pages)
+        img = Image.new("RGB", (w, sum(p.height for p in pages)), "white")
+        y = 0
+        for p in pages:
+            img.paste(p, (0, y))
+            y += p.height
+    img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     await msg.reply_chat_action("typing")
     try:
         photo = msg.photo[-1] if msg.photo else None
-        doc = msg.document if (msg.document and
-                               (msg.document.mime_type or "").startswith("image/")) else None
+        doc = msg.document
+        doc_mime = (doc.mime_type or "") if doc else ""
         if photo:
             f = await photo.get_file()
             mime = "image/jpeg"
-        elif doc:
+        elif doc and (doc_mime.startswith("image/") or doc_mime == "application/pdf"):
             f = await doc.get_file()
-            mime = doc.mime_type
+            mime = doc_mime
+        elif doc:
+            await msg.reply_text(
+                "❌ I can read photos and PDF invoices, but not this file type "
+                f"({doc_mime or 'unknown'}). Send a photo or PDF instead.")
+            return
         else:
             return
         image_bytes = bytes(await f.download_as_bytearray())
+        if mime == "application/pdf":
+            image_bytes = _pdf_to_jpeg(image_bytes)
+            mime = "image/jpeg"
         await _parse_and_preview(update, text=msg.caption, image_bytes=image_bytes, mime=mime)
     except Exception:
         log.exception("photo handling failed")
@@ -307,7 +337,7 @@ async def cmd_stock(update: Update, context):
         lines = ["📦 <b>Current stock</b>"]
         for item, stock in snap:
             warn = " ⚠️" if item.reorder_threshold and stock < item.reorder_threshold else ""
-            lines.append(f"• {item.name}: {stock:g}{item.unit}{warn}")
+            lines.append(f"• {item.name}: {logic.fmt_qty(item, stock)}{warn}")
         await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     finally:
         session.close()
@@ -364,7 +394,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("low", cmd_low))
     application.add_handler(CommandHandler("spend", cmd_spend))
     application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE,
-                                           handle_photo))
+    application.add_handler(MessageHandler(
+        filters.PHOTO | filters.Document.IMAGE | filters.Document.ALL, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return application
