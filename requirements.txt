@@ -8,3 +8,6 @@ anthropic>=0.34
 openai>=1.30
 google-genai>=1.0
 python-multipart>=0.0.9
+pypdfium2>=4.28
+Pillow>=10.0
+
