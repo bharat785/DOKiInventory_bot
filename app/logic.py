@@ -15,6 +15,25 @@ EXPENSE_CATEGORIES = ["raw_material", "packaging", "utilities", "repairs",
 
 
 # ------------------------------------------------------------------ items
+def parse_pack_size(s) -> float | None:
+    """'300g' -> 300, '1.5kg' -> 1500, '250 g' -> 250. None if not weight-based."""
+    import re as _re
+    if not s:
+        return None
+    m = _re.match(r"\s*([\d.]+)\s*(kg|g|gm|gms|grams?)\s*$", str(s), _re.I)
+    if not m:
+        return None
+    val = float(m.group(1))
+    return val * 1000 if m.group(2).lower() == "kg" else val
+
+
+def fmt_qty(item, qty: float) -> str:
+    """Display grammage first for packaged items: '21.6kg (72 pcs)'."""
+    if item.pack_size_g and item.unit in ("pcs", "box", "bag"):
+        grams = qty * item.pack_size_g
+        wt = f"{grams / 1000:g}kg" if abs(grams) >= 1000 else f"{grams:g}g"
+        return f"{wt} ({qty:g} {item.unit})"
+    return f"{qty:g}{item.unit}"
 def find_item(session, name: str):
     """Match by name or alias, case-insensitive."""
     if not name:
@@ -29,11 +48,15 @@ def find_item(session, name: str):
     return None
 
 
-def get_or_create_item(session, name: str, unit: str = "kg", category="raw_material"):
+def get_or_create_item(session, name: str, unit: str = "kg", category="raw_material",
+                       pack_size=None):
     item = find_item(session, name)
     if item:
+        if item.pack_size_g is None and pack_size:
+            item.pack_size_g = parse_pack_size(pack_size)
         return item, False
-    item = Item(name=name.strip().title(), unit=unit or "kg", category=category)
+    item = Item(name=name.strip().title(), unit=unit or "kg", category=category,
+                pack_size_g=parse_pack_size(pack_size))
     session.add(item)
     session.flush()
     return item, True
@@ -88,7 +111,8 @@ def commit_entry(session, payload: dict, created_by: str):
             result["payment_ids"].append(payment.id)
         for line in payload.get("lines", []):
             item, created = get_or_create_item(session, line["item"],
-                                               line.get("unit", "kg"))
+                                               line.get("unit", "kg"),
+                                               pack_size=line.get("pack_size"))
             if created:
                 result["new_items"].append(item.name)
             qty = float(line["qty"])
@@ -103,7 +127,7 @@ def commit_entry(session, payload: dict, created_by: str):
             result["txn_ids"].append(txn.id)
             stock = current_stock(session, item.id)
             result["summary_lines"].append(
-                f"{item.name} +{qty:g}{item.unit} → stock {stock:g}{item.unit}")
+                f"{item.name} +{fmt_qty(item, qty)} → stock {fmt_qty(item, stock)}")
             _reset_alert_if_recovered(item, stock)
         if total:
             result["summary_lines"].append(
@@ -166,7 +190,7 @@ def commit_entry(session, payload: dict, created_by: str):
             result["txn_ids"].append(txn.id)
             stock = current_stock(session, bl.item_id)
             result["summary_lines"].append(
-                f"{bl.item.name} -{used:g}{bl.item.unit} → stock {stock:g}{bl.item.unit}")
+                f"{bl.item.name} -{fmt_qty(bl.item, used)} → stock {fmt_qty(bl.item, stock)}")
             if _breached(bl.item, stock):
                 result["low_stock"].append((bl.item, stock))
 
@@ -184,7 +208,7 @@ def commit_entry(session, payload: dict, created_by: str):
             result["txn_ids"].append(txn.id)
             stock = current_stock(session, item.id)
             result["summary_lines"].append(
-                f"{item.name} -{qty:g}{item.unit} → stock {stock:g}{item.unit}")
+                f"{item.name} -{fmt_qty(item, qty)} → stock {fmt_qty(item, stock)}")
             if _breached(item, stock):
                 result["low_stock"].append((item, stock))
     else:

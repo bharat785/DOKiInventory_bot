@@ -27,6 +27,8 @@ class Item(Base):
     name = Column(String(120), unique=True, nullable=False)
     aliases = Column(Text, default="")          # comma-separated alternate names
     unit = Column(String(20), default="kg")     # kg, g, L, pcs, box...
+    # grams per piece for packaged items (e.g. 300 for a 300g cup); null for loose
+    pack_size_g = Column(Float)
     category = Column(String(50), default="raw_material")
     reorder_threshold = Column(Float, default=0)
     # True when a low-stock alert has fired and stock hasn't recovered yet
@@ -121,7 +123,18 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def init_db():
+    from sqlalchemy import text
     Base.metadata.create_all(engine)
+    # lightweight migration for columns added after first deploy
+    try:
+        with engine.begin() as conn:
+            if engine.dialect.name == "postgresql":
+                conn.execute(text(
+                    "ALTER TABLE items ADD COLUMN IF NOT EXISTS pack_size_g DOUBLE PRECISION"))
+            else:
+                conn.execute(text("ALTER TABLE items ADD COLUMN pack_size_g FLOAT"))
+    except Exception:
+        pass  # column already exists
 
 
 def current_stock(session, item_id: int) -> float:
