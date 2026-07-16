@@ -100,7 +100,7 @@ def stock_page(request: Request):
             low = item.reorder_threshold and stock < item.reorder_threshold
             lp = logic.last_purchase(session, item.id)
             rows += f"""<tr><td>{item.name} <span class=badge>{item.category.replace('_', ' ')}</span></td>
-<td class="{'low' if low else 'ok'}">{stock:g} {item.unit}</td>
+<td class="{'low' if low else 'ok'}">{logic.fmt_qty(item, stock)}</td>
 <td>{(f"{item.reorder_threshold:g}" if item.reorder_threshold else "—")}</td>
 <td>{f"{lp.entry_date} · {config.CURRENCY}{lp.unit_cost:g}/{item.unit}" if lp and lp.unit_cost else (str(lp.entry_date) if lp else "—")}</td></tr>"""
         body = f"""
@@ -290,6 +290,8 @@ def items_page(request: Request):
 <td><form class=inline method=post action=/items/threshold>
 <input type=hidden name=item_id value={i.id}>
 <input name=threshold value="{i.reorder_threshold:g}" size=6>
+<input name=pack_g value="{f'{i.pack_size_g:g}' if i.pack_size_g else ''}"
+ size=6 placeholder="g/pc">
 <button>Save</button></form></td></tr>""" for i in items)
         opt_items = "".join(f"<option value={i.id}>{i.name} ({i.unit})</option>" for i in items)
         prod_blocks = ""
@@ -302,6 +304,16 @@ def items_page(request: Request):
 <input type=hidden name=product_id value={p.id}>
 <select name=item_id>{opt_items}</select>
 <input name=qty placeholder="qty per unit" size=8><button>Add line</button></form></div>"""
+        importer = """<div class=card><h2>Import recipe (bulk)</h2>
+<p style="color:var(--mut)">One product per import. First line:
+<code>product: Name (unit)</code>, then one ingredient per line:
+<code>name, qty per unit, unit</code>. Replaces the product's existing recipe.</p>
+<form method=post action=/recipes/import>
+<textarea name=recipe_text rows=8 style="width:100%;font-family:monospace"
+placeholder="product: Teriyaki Chicken Jerky (pack)
+Chicken Raw, 85.16, g
+Teriyaki Sauce, 4.35, g"></textarea>
+<button style="margin-top:8px">Import recipe</button></form></div>"""
         danger = f"""<div class=card style="border:1px solid var(--warn)">
 <h2 style="color:var(--warn)">⚠️ Danger zone — wipe all data</h2>
 <p style="color:var(--mut)">Deletes ALL items, stock, payments, recipes, and count history.
@@ -313,7 +325,7 @@ Use this once to clear test data before going live. Cannot be undone.</p>
 <button style="background:var(--warn)">Wipe all data</button></form></div>"""
         body = f"""
 <div class=card><h2>Items & alert thresholds</h2>
-<table><tr><th>Item</th><th>Unit</th><th>Alert when below</th></tr>{item_rows}</table>
+<table><tr><th>Item</th><th>Unit</th><th>Alert threshold &amp; pack size (g per piece)</th></tr>{item_rows}</table>
 <form class=inline method=post action=/items/add style="margin-top:12px">
 <input name=name placeholder="New item name">
 <select name=unit><option>kg</option><option>g</option><option>L</option><option>ml</option>
@@ -327,6 +339,7 @@ Use this once to clear test data before going live. Cannot be undone.</p>
 <input name=unit placeholder="unit (pcs/pack/box)" value=pcs size=10>
 <button>Add product</button></form></div>
 {prod_blocks}
+{importer}
 {danger}"""
         return page("Items & Recipes", "/items", body)
     finally:
@@ -376,14 +389,23 @@ async def admin_wipe(request: Request):
 
 
 @router.post("/items/threshold")
-def set_threshold(request: Request, item_id: int = Form(...), threshold: float = Form(...)):
+async def set_threshold(request: Request):
     if (r := guard(request)):
         return r
+    form = await request.form()
     session = SessionLocal()
     try:
-        item = session.get(Item, item_id)
+        item = session.get(Item, int(form.get("item_id", 0)))
         if item:
-            item.reorder_threshold = threshold
+            try:
+                item.reorder_threshold = float(form.get("threshold") or 0)
+            except ValueError:
+                pass
+            pack = str(form.get("pack_g") or "").strip()
+            try:
+                item.pack_size_g = float(pack) if pack else None
+            except ValueError:
+                pass
             item.alert_sent = False
             session.commit()
         return RedirectResponse("/items", status_code=302)
@@ -429,6 +451,52 @@ def add_bom(request: Request, product_id: int = Form(...), item_id: int = Form(.
         session.add(BomLine(product_id=product_id, item_id=item_id, qty_per_unit=qty))
         session.commit()
         return RedirectResponse("/items", status_code=302)
+    finally:
+        session.close()
+
+
+@router.post("/recipes/import")
+async def import_recipe(request: Request):
+    """Bulk recipe import. Format:
+        product: Teriyaki Chicken Jerky (pack)
+        Chicken Raw, 85.16, g
+        Teriyaki Sauce, 4.35, g
+    Replaces the product's existing BOM."""
+    if (r := guard(request)):
+        return r
+    form = await request.form()
+    text = str(form.get("recipe_text") or "")
+    session = SessionLocal()
+    try:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines or not lines[0].lower().startswith("product:"):
+            return RedirectResponse("/items?import=bad_format", status_code=302)
+        import re as _re
+        head = lines[0].split(":", 1)[1].strip()
+        m = _re.match(r"^(.*?)\s*\(([^)]+)\)\s*$", head)
+        pname, punit = (m.group(1), m.group(2)) if m else (head, "pcs")
+        product = logic.find_product(session, pname)
+        if not product:
+            product = Product(name=pname.strip().title(), unit=punit)
+            session.add(product)
+            session.flush()
+        for bl in list(product.bom_lines):
+            session.delete(bl)
+        session.flush()
+        for ln in lines[1:]:
+            parts = [p.strip() for p in ln.split(",")]
+            if len(parts) < 2:
+                continue
+            name, qty = parts[0], float(parts[1])
+            unit = parts[2] if len(parts) > 2 else "g"
+            item, _ = logic.get_or_create_item(session, name, unit)
+            session.add(BomLine(product_id=product.id, item_id=item.id,
+                                qty_per_unit=qty))
+        session.commit()
+        return RedirectResponse("/items", status_code=302)
+    except (ValueError, IndexError):
+        session.rollback()
+        return RedirectResponse("/items?import=bad_format", status_code=302)
     finally:
         session.close()
 

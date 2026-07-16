@@ -23,7 +23,8 @@ def _user(update: Update) -> str:
 
 
 def _known_names(session):
-    items = [i.name for i in session.query(Item).filter(Item.active.is_(True)).all()]
+    items = [f"{i.name} ({i.unit})"
+             for i in session.query(Item).filter(Item.active.is_(True)).all()]
     products = [p.name for p in session.query(Product).filter(Product.active.is_(True)).all()]
     return items, products
 

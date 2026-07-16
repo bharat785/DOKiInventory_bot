@@ -28,7 +28,10 @@ Entry kinds:
 - "stock_out": raw material issued/removed manually (e.g. "used 20kg flour", "threw away 5kg sugar")
 - "unknown": cannot tell
 
-Known item names (match these when possible, but include new items too): {items}
+Known items with their stock unit in parentheses (match names when possible; include
+new items too). IMPORTANT: when a purchase is for a known item, output "qty" CONVERTED
+to that item's stock unit (e.g. item "Soy Sauce (g)" bought as "5 kg" -> qty 5000,
+unit "g"): {items}
 Known product names: {products}
 
 Respond with ONLY a JSON object, no markdown fences:
