@@ -35,7 +35,8 @@ h1{font-size:20px}h2{font-size:16px}
 
 def page(title, active, body):
     tabs = [("Stock", "/"), ("Count", "/count"), ("Spend", "/spend"),
-            ("Variance", "/variance"), ("Items & Recipes", "/items")]
+            ("Variance", "/variance"), ("Economics", "/economics"),
+            ("Items & Recipes", "/items")]
     nav = "".join(f'<a href="{u}" class="{"active" if u == active else ""}">{t}</a>'
                   for t, u in tabs)
     return HTMLResponse(f"""<!doctype html><html><head><meta charset=utf-8>
@@ -272,6 +273,58 @@ Consistent negatives on one item usually mean the recipe under-states real usage
 <table><tr><th>Date</th><th>Item</th><th>Expected</th><th>Counted</th><th>Variance</th><th>By</th></tr>
 {rows or '<tr><td colspan=6>No counts yet — the bot asks every Sunday.</td></tr>'}</table></div>"""
         return page("Variance", "/variance", body)
+    finally:
+        session.close()
+
+
+# -------------------------------------------------------- unit economics
+@router.get("/economics", response_class=HTMLResponse)
+def economics_page(request: Request, days: int = 28):
+    if (r := guard(request)):
+        return r
+    session = SessionLocal()
+    try:
+        eco = logic.unit_economics(session, days)
+        blocks = ""
+        for p in eco["products"]:
+            rows = ""
+            for ln in p["lines"]:
+                wac = (f"{config.CURRENCY}{ln['wac']:,.2f}" if ln["wac"] is not None
+                       else "<span class=low>no price data</span>")
+                fac = (f"<span class=low>+{(ln['factor'] - 1) * 100:.0f}%</span>"
+                       if ln["factor"] > 1.02 else
+                       (f"<span class=ok>{(ln['factor'] - 1) * 100:+.0f}%</span>"
+                        if ln["factor"] < 0.98 else "—"))
+                rows += (f"<tr><td>{ln['item']}</td>"
+                         f"<td>{ln['qty']:g} {ln['unit']}</td><td>{wac}</td>"
+                         f"<td>{config.CURRENCY}{ln['cost']:,.2f}</td>"
+                         f"<td>{fac}</td>"
+                         f"<td>{config.CURRENCY}{ln['true_cost']:,.2f}</td></tr>")
+            warn = ""
+            if p["missing"]:
+                warn = (f"<p class=low>⚠️ No purchase prices yet for: "
+                        f"{', '.join(p['missing'])} — costs shown as ₹0 until "
+                        f"their first invoice is logged.</p>")
+            gap = p["true"] - p["theoretical"]
+            blocks += f"""<div class=card><h2>{p['product']}
+<span class=badge>per {p['unit']}</span></h2>{warn}
+<table><tr><th>Ingredient</th><th>Recipe qty</th><th>Live avg price</th>
+<th>Cost</th><th>Wastage (last {eco['days']}d)</th><th>True cost</th></tr>{rows}</table>
+<div class=kpi style="margin-top:10px">
+<div><b>{config.CURRENCY}{p['theoretical']:,.2f}</b>theoretical / {p['unit']}</div>
+<div><b>{config.CURRENCY}{p['true']:,.2f}</b>true / {p['unit']} (incl. wastage)</div>
+<div><b class="{'low' if gap > 0.5 else 'ok'}">{config.CURRENCY}{gap:+,.2f}</b>wastage cost / {p['unit']}</div>
+</div></div>"""
+        if not blocks:
+            blocks = ("<div class=card><p>No recipes yet — import one on the "
+                      "Items &amp; Recipes tab.</p></div>")
+        intro = f"""<div class=card><p style="color:var(--mut)">
+<b>Theoretical</b> = recipe quantities × weighted-average price from your actual
+invoices (updates with every purchase). <b>True</b> = theoretical corrected by
+measured wastage: production draw-downs vs weekly count adjustments over the
+last {eco['days']} days. A wastage of +8% on chicken means the counts show you
+actually consume 8% more than the recipe says.</p></div>"""
+        return page("Economics", "/economics", intro + blocks)
     finally:
         session.close()
 

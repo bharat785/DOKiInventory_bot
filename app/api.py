@@ -100,6 +100,17 @@ def payments(request: Request, token: str = Query(None),
         session.close()
 
 
+@router.get("/economics")
+def economics(request: Request, token: str = Query(None),
+              days: int = Query(28, le=365)):
+    _check(request, token)
+    session = SessionLocal()
+    try:
+        return logic.unit_economics(session, days)
+    finally:
+        session.close()
+
+
 @router.get("/counts")
 def counts(request: Request, token: str = Query(None),
            days: int = Query(365, le=1095)):

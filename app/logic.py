@@ -319,6 +319,69 @@ def _post_count(session, item, counted, created_by):
     return [(item, expected, float(counted), variance)]
 
 
+# -------------------------------------------------------- unit economics
+def weighted_avg_cost(session, item_id):
+    """₹ per item-unit from actual purchase history. None if no priced purchases."""
+    rows = (session.query(InventoryTxn)
+            .filter(InventoryTxn.item_id == item_id,
+                    InventoryTxn.txn_type == "purchase").all())
+    qty = cost = 0.0
+    for r in rows:
+        c = r.total_cost if r.total_cost else (r.unit_cost or 0) * r.qty
+        if c:
+            qty += r.qty
+            cost += c
+    return (cost / qty) if qty else None
+
+
+def wastage_factors(session, days=28):
+    """Per item: actual usage vs recipe usage from recent production + count
+    adjustments. factor 1.08 = using 8% more than the recipe says."""
+    since = dt.date.today() - dt.timedelta(days=days)
+    out = {}
+    rows = (session.query(InventoryTxn)
+            .filter(InventoryTxn.entry_date >= since,
+                    InventoryTxn.txn_type.in_(["production_out", "adjustment"]))
+            .all())
+    per_item = {}
+    for r in rows:
+        d = per_item.setdefault(r.item_id, {"prod": 0.0, "adj": 0.0})
+        if r.txn_type == "production_out":
+            d["prod"] += -r.qty
+        else:
+            d["adj"] += -r.qty  # negative adjustment (missing stock) => positive here
+    for item_id, d in per_item.items():
+        if d["prod"] > 0:
+            out[item_id] = {"recipe_usage": d["prod"], "extra": d["adj"],
+                            "factor": max(0.0, (d["prod"] + d["adj"]) / d["prod"])}
+    return out
+
+
+def unit_economics(session, days=28):
+    """Per product: live theoretical cost/pack + wastage-adjusted true cost."""
+    factors = wastage_factors(session, days)
+    products = []
+    for p in (session.query(Product).filter(Product.active.is_(True))
+              .order_by(Product.name).all()):
+        if not p.bom_lines:
+            continue
+        lines, theo, true, missing = [], 0.0, 0.0, []
+        for bl in p.bom_lines:
+            wac = weighted_avg_cost(session, bl.item_id)
+            f = factors.get(bl.item_id, {}).get("factor", 1.0)
+            cost = (wac or 0) * bl.qty_per_unit
+            lines.append({"item": bl.item.name, "qty": bl.qty_per_unit,
+                          "unit": bl.item.unit, "wac": wac, "cost": cost,
+                          "factor": f, "true_cost": cost * f})
+            theo += cost
+            true += cost * f
+            if wac is None:
+                missing.append(bl.item.name)
+        products.append({"product": p.name, "unit": p.unit, "lines": lines,
+                         "theoretical": theo, "true": true, "missing": missing})
+    return {"products": products, "factors": factors, "days": days}
+
+
 # ---------------------------------------------------------------- digests
 def daily_digest(session, day=None):
     day = day or dt.date.today()
